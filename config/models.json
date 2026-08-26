@@ -1,0 +1,5 @@
+{
+  "gatekeeper": "qwen2.5-1.5b-instruct-q4_k_m.gguf",
+  "chat": "qwen3b-4q",
+  "reasoning": "deepshrink"
+}

@@ -1,0 +1,6 @@
+{
+  "name": "JARVIS",
+  "offline": true,
+  "architecture": "organism-first",
+  "autonomous_learning": false
+}
