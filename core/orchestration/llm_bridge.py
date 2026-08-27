@@ -219,20 +219,37 @@ class HybridLLMBridge:
             )
         return self._local_engine
 
-    def generate_response(self, system_prompt: str, user_input: str) -> str:
+    def generate_response(
+        self,
+        system_prompt: str,
+        user_input: str,
+        max_tokens: int = 512,
+        temperature: float = 0.7,
+        **kwargs,
+    ) -> str:
         online = self._is_online()
         have_groq_key = bool(os.getenv("GROQ_API_KEY") or os.getenv("GROK_API_KEY"))
 
         if online and have_groq_key:
             try:
                 engine = self._get_groq()
-                return engine.generate(system_prompt, user_input)
+                return engine.generate(
+                    system_prompt=system_prompt,
+                    user_input=user_input,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
             except Exception as exc:
                 print(f"[JARVIS LLM] Groq API failed ({exc}), falling back to offline model.")
 
         try:
             engine = self._get_local()
-            return engine.generate(system_prompt, user_input)
+            return engine.generate(
+                system_prompt=system_prompt,
+                user_input=user_input,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
         except Exception as exc:
             return f"[Model Generation Error: {exc}]"
 

@@ -7,12 +7,71 @@ import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import faiss
 import networkx as nx
 import numpy as np
-from sentence_transformers import SentenceTransformer
+import onnxruntime as ort
+from tokenizers import Tokenizer
+
+
+# =============================================================
+# LIGHTWEIGHT ONNX EMBEDDER (Replaces PyTorch/SentenceTransformers)
+# =============================================================
+class FastONNXEmbedder:
+    """Lightweight CPU-only embedder using ONNX Runtime for ARM64 / Termux."""
+
+    def __init__(
+        self,
+        model_path: str = "all-MiniLM-L6-v2.onnx",
+        tokenizer_path: str = "tokenizer.json",
+    ):
+        self.model_path = model_path
+        self.tokenizer_path = tokenizer_path
+        self.vector_dim = 384
+
+        # Fallback if files don't exist yet
+        if not os.path.exists(model_path) or not os.path.exists(tokenizer_path):
+            print(f"[ONNXEmbedder] Warning: {model_path} or {tokenizer_path} not found!")
+
+        self.session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+        self.tokenizer = Tokenizer.from_file(tokenizer_path)
+        self.tokenizer.enable_padding(length=128, pad_id=0, pad_token="[PAD]")
+        self.tokenizer.enable_truncation(max_length=128)
+
+    def get_sentence_embedding_dimension(self) -> int:
+        return self.vector_dim
+
+    def encode(self, sentences: Union[str, List[str]], show_progress_bar: bool = False) -> np.ndarray:
+        is_single = isinstance(sentences, str)
+        text_list = [sentences] if is_single else sentences
+
+        encoded_batch = [self.tokenizer.encode(t) for t in text_list]
+        input_ids = np.array([e.ids for e in encoded_batch], dtype=np.int64)
+        attention_mask = np.array([e.attention_mask for e in encoded_batch], dtype=np.int64)
+        token_type_ids = np.array([e.type_ids for e in encoded_batch], dtype=np.int64)
+
+        inputs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "token_type_ids": token_type_ids,
+        }
+
+        outputs = self.session.run(None, inputs)
+        embeddings = outputs[0]
+
+        # Mean Pooling
+        mask_expanded = np.expand_dims(attention_mask, -1)
+        sum_embeddings = np.sum(embeddings * mask_expanded, axis=1)
+        sum_mask = np.clip(mask_expanded.sum(axis=1), a_min=1e-9, a_max=None)
+        pooled = sum_embeddings / sum_mask
+
+        # Normalize Vectors for Cosine / L2 distance
+        norms = np.linalg.norm(pooled, axis=1, keepdims=True)
+        normalized = (pooled / np.clip(norms, a_min=1e-9, a_max=None)).astype(np.float32)
+
+        return normalized[0] if is_single else normalized
 
 
 @dataclass
@@ -82,50 +141,17 @@ class Knowledge:
 
 
 class SemanticMemory:
-    """Long-term knowledge store of JARVIS.
+    """Long-term knowledge store of JARVIS (Android PRoot Optimized)."""
 
-    Combines:
-    - Persistent SQLite Database for durable storage.
-    - NetworkX Graph Engine for relationship tracking.
-    - FAISS Vector Store using IndexIDMap2 for semantic similarity search.
-
-    ----------------------------------------------------------------
-    FIX LOG (this version)
-    ----------------------------------------------------------------
-    1. CRASH BUG: `self.embedder.get_embedding_dimension()` does not
-       exist on SentenceTransformer — the real method is
-       `get_sentence_embedding_dimension()`. This was almost
-       certainly throwing an AttributeError on every construction,
-       silently killing the whole semantic-memory organ depending on
-       how the caller handled the exception.
-
-    2. FAISS IDS NOW PERSISTED: previously, faiss_id was recomputed
-       every process restart as a sequential counter over whatever
-       order `SELECT * FROM knowledge` happened to return (SQLite
-       does not guarantee row order without ORDER BY). If that order
-       ever differed from the order the on-disk FAISS index was
-       originally built in, vectors would silently map to the WRONG
-       knowledge_id after a restart — silent data corruption with no
-       error. faiss_id is now a real persisted column, assigned once
-       per knowledge item and never recomputed.
-
-    3. HYBRID SEARCH: added `hybrid_search()` which combines FAISS
-       semantic similarity with the lexical LIKE search and merges/
-       dedupes results (semantic first, lexical fills gaps). This is
-       now what MemoryManager should call — semantic_search() alone
-       stays available for callers that specifically want pure
-       vector search.
-    ----------------------------------------------------------------
-    """
-
-    VERSION = "0.3.0"
+    VERSION = "0.3.5"
 
     def __init__(
         self,
-        db_path: str = "jarvis_semantic_memory.db",
+        db_path: str = "database/jarvis.db",
         faiss_index_path: str = "jarvis_faiss.index",
         max_knowledge: int = 10000,
-        model_name: str = "all-MiniLM-L6-v2",
+        model_path: str = "all-MiniLM-L6-v2.onnx",
+        tokenizer_path: str = "tokenizer.json",
     ):
         self.db_path = db_path
         self.faiss_index_path = faiss_index_path
@@ -135,19 +161,11 @@ class SemanticMemory:
         # 1. SQLite Database Setup
         self._init_sqlite_db()
 
-        # 2. Embedding Model & FAISS Setup
-        print("[SemanticMemory] Loading Embedding Model & FAISS Vector Store...")
-        self.embedder = SentenceTransformer(model_name)
-        
-        if hasattr(self.embedder, "get_sentence_embedding_dimension"):
-            self.vector_dim = self.embedder.get_sentence_embedding_dimension()
-        elif hasattr(self.embedder, "get_embedding_dimension"):
-            self.vector_dim = self.embedder.get_embedding_dimension()
-        else:
-            self.vector_dim = getattr(self.embedder, "vector_dim", 384)
-        
-        # FIX: correct SentenceTransformer API name.
+        # 2. Fast ONNX Embedding Model & FAISS Setup
+        print("[SemanticMemory] Loading ONNX Fast Embedder & FAISS Vector Store...")
+        self.embedder = FastONNXEmbedder(model_path=model_path, tokenizer_path=tokenizer_path)
         self.vector_dim = self.embedder.get_sentence_embedding_dimension()
+
         self.faiss_index = faiss.IndexIDMap2(faiss.IndexFlatL2(self.vector_dim))
         self.id_to_faiss_idx: Dict[str, int] = {}
         self.faiss_idx_to_id: Dict[int, str] = {}
@@ -161,10 +179,6 @@ class SemanticMemory:
 
         self.created_at = time.time()
         self.updated_at = self.created_at
-
-    # =============================================================
-    # INITIALIZATION & HYDRATION HELPERS
-    # =============================================================
 
     def _get_db_connection(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, check_same_thread=False)
@@ -193,8 +207,9 @@ class SemanticMemory:
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_subject ON knowledge(subject);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_predicate ON knowledge(predicate);")
+            # Fast Biological Trace Index (Subject + Predicate)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_sub_pred ON knowledge(subject, predicate);")
 
-            # Migration path for databases created before faiss_id existed.
             try:
                 conn.execute("SELECT faiss_id FROM knowledge LIMIT 1;")
             except sqlite3.OperationalError:
@@ -214,8 +229,6 @@ class SemanticMemory:
             if not rows:
                 return
 
-            # Assign faiss_id to any legacy rows that don't have one yet
-            # (pre-migration data), persisting it so it never shifts again.
             max_existing = 0
             for row in rows:
                 if row.get("faiss_id") is not None:
@@ -250,10 +263,6 @@ class SemanticMemory:
                 texts_to_embed.append(text_to_embed)
                 faiss_ids.append(faiss_id)
 
-            # Try to reuse the on-disk index (ids are now stable/persisted
-            # so this is safe across restarts). If it's missing, unreadable,
-            # or its id set doesn't match what's in the DB, rebuild from
-            # scratch using the persisted faiss_ids.
             loaded_ok = False
             if os.path.exists(self.faiss_index_path):
                 try:
@@ -273,10 +282,6 @@ class SemanticMemory:
         self.faiss_index.add_with_ids(vectors, np.array(ids, dtype=np.int64))
         self._save_faiss_to_disk()
 
-    # =============================================================
-    # STORE / LEARN
-    # =============================================================
-
     def remember(
         self,
         subject: str,
@@ -287,40 +292,58 @@ class SemanticMemory:
         source: Optional[str] = None,
         tags: Optional[List[str]] = None,
     ) -> Knowledge:
-        """Add new knowledge or reinforce existing knowledge."""
         subject = self._normalize(subject)
         predicate = self._normalize(predicate)
 
-        if not subject:
-            raise ValueError("subject cannot be empty.")
-        if not predicate:
-            raise ValueError("predicate cannot be empty.")
+        if not subject or not predicate:
+            raise ValueError("subject and predicate cannot be empty.")
 
         with self._lock:
-            existing = self._find_exact(subject, predicate, value)
+            # 🧠 1. BIOLOGICAL ENGRAM LOOKUP (Subject + Predicate Trace)
+            existing = self._find_by_trace(subject, predicate)
 
-            # -----------------------------------------------------
-            # Reinforce existing knowledge
-            # -----------------------------------------------------
             if existing is not None:
+                # RECONSOLIDATION: Retain SAME knowledge_id & faiss_id
+                old_val_norm = self._normalize(existing.value)
+                new_val_norm = self._normalize(value)
+                value_changed = old_val_norm != new_val_norm
+
                 existing.evidence_count += 1
                 existing.confidence = self._merge_confidence(existing.confidence, confidence)
                 existing.importance = max(existing.importance, self._clamp(importance))
+                existing.updated_at = time.time()
+                existing.value = value
 
                 if source:
                     existing.source = source
                 if tags:
-                    existing.tags = list(set(existing.tags + tags))
+                    existing.tags = list(set(existing.tags + (tags or [])))
 
-                existing.updated_at = time.time()
                 existing_faiss_id = self.id_to_faiss_idx.get(existing.knowledge_id)
+
+                # Overwrite/Update SQLite Record on SAME knowledge_id
                 self._save_knowledge_to_db(existing, faiss_id=existing_faiss_id)
+
+                # Update Graph Edge if Value Changed
+                if value_changed:
+                    if self.graph.has_edge(existing.subject, old_val_norm):
+                        self.graph.remove_edge(existing.subject, old_val_norm)
+                    self._add_to_graph(existing)
+
+                    # In-Place FAISS Vector Update (Same faiss_id)
+                    if existing_faiss_id is not None:
+                        text_to_embed = f"{existing.subject} {existing.predicate} {str(existing.value)}"
+                        vector = self.embedder.encode(text_to_embed).astype(np.float32)
+                        self.faiss_index.remove_ids(np.array([existing_faiss_id], dtype=np.int64))
+                        self.faiss_index.add_with_ids(
+                            np.array([vector]), np.array([existing_faiss_id], dtype=np.int64)
+                        )
+
                 self.updated_at = existing.updated_at
+                self._save_faiss_to_disk()
                 return existing
 
-            # -----------------------------------------------------
-            # Create new knowledge
-            # -----------------------------------------------------
+            # 🧠 2. NOVEL FACT CREATION (New Engram Node)
             now = time.time()
             knowledge = Knowledge(
                 knowledge_id=str(uuid.uuid4()),
@@ -343,7 +366,7 @@ class SemanticMemory:
             self._add_to_graph(knowledge)
 
             text_to_embed = f"{knowledge.subject} {knowledge.predicate} {str(knowledge.value)}"
-            vector = self.embedder.encode([text_to_embed])[0].astype(np.float32)
+            vector = self.embedder.encode(text_to_embed).astype(np.float32)
 
             self.faiss_index.add_with_ids(
                 np.array([vector]), np.array([faiss_id], dtype=np.int64)
@@ -358,7 +381,6 @@ class SemanticMemory:
             return knowledge
 
     def forget(self, knowledge_id: str) -> bool:
-        """Remove knowledge item from DB, Graph, and FAISS."""
         with self._lock:
             item = self.get(knowledge_id)
             if not item:
@@ -381,17 +403,12 @@ class SemanticMemory:
             self._save_faiss_to_disk()
             return True
 
-    # =============================================================
-    # SEARCH & RETRIEVAL METHODS
-    # =============================================================
-
     def semantic_search(self, query: str, top_k: int = 5) -> List[Knowledge]:
-        """Meaning-based search using FAISS vector embeddings."""
         with self._lock:
             if self.faiss_index.ntotal == 0:
                 return []
 
-            query_vector = self.embedder.encode([query])[0].astype(np.float32)
+            query_vector = self.embedder.encode(query).astype(np.float32)
             k_search = min(top_k, self.faiss_index.ntotal)
             distances, indices = self.faiss_index.search(np.array([query_vector]), k_search)
 
@@ -406,19 +423,7 @@ class SemanticMemory:
             return results
 
     def hybrid_search(self, query: str, limit: int = 20) -> List[Knowledge]:
-        """
-        Robust retrieval: FAISS semantic similarity first (catches
-        meaning/paraphrase matches the lexical search would miss),
-        then lexical LIKE search fills in any exact keyword matches
-        FAISS might rank low. Deduped by knowledge_id, semantic
-        results kept first.
-
-        This is what Brain/MemoryManager should call for
-        `build_context()` / `search_knowledge()` — it's the method
-        that was previously never being invoked.
-        """
         semantic_results = self.semantic_search(query, top_k=limit)
-
         seen_ids = {item.knowledge_id for item in semantic_results}
         remaining = max(0, limit - len(semantic_results))
 
@@ -434,7 +439,6 @@ class SemanticMemory:
         return semantic_results + lexical_results
 
     def get_graph_relations(self, subject: str) -> List[Dict[str, Any]]:
-        """Retrieve connection paths from NetworkX Graph."""
         subject = self._normalize(subject)
         with self._lock:
             if subject not in self.graph:
@@ -455,7 +459,6 @@ class SemanticMemory:
         predicate: Optional[str] = None,
         value: Any = None,
     ) -> List[Knowledge]:
-        """Find knowledge using subject/predicate/value wildcard filters."""
         subject = self._normalize(subject)
         query = "SELECT * FROM knowledge WHERE subject = ?"
         params: List[Any] = [subject]
@@ -472,34 +475,7 @@ class SemanticMemory:
             cursor = conn.execute(query, params)
             return [Knowledge.from_dict(dict(row)) for row in cursor.fetchall()]
 
-    def find_by_subject(self, subject: str, limit: int = 50) -> List[Knowledge]:
-        results = self.find(subject)
-        results.sort(
-            key=lambda item: (item.importance, item.confidence, item.updated_at),
-            reverse=True,
-        )
-        return results[:limit]
-
-    def find_by_predicate(self, predicate: str, limit: int = 50) -> List[Knowledge]:
-        predicate = self._normalize(predicate)
-        with self._lock, self._get_db_connection() as conn:
-            cursor = conn.execute(
-                "SELECT * FROM knowledge WHERE predicate = ? ORDER BY updated_at DESC LIMIT ?",
-                (predicate, limit),
-            )
-            return [Knowledge.from_dict(dict(row)) for row in cursor.fetchall()]
-
-    def find_by_tag(self, tag: str, limit: int = 50) -> List[Knowledge]:
-        tag_norm = f"%{self._normalize(tag)}%"
-        with self._lock, self._get_db_connection() as conn:
-            cursor = conn.execute(
-                "SELECT * FROM knowledge WHERE tags LIKE ? ORDER BY updated_at DESC LIMIT ?",
-                (tag_norm, limit),
-            )
-            return [Knowledge.from_dict(dict(row)) for row in cursor.fetchall()]
-
     def search(self, query: str, limit: int = 20) -> List[Knowledge]:
-        """Lightweight lexical text search across all attributes."""
         query_norm = f"%{self._normalize(query)}%"
         sql = """
             SELECT * FROM knowledge
@@ -521,53 +497,6 @@ class SemanticMemory:
             row = cursor.fetchone()
             return Knowledge.from_dict(dict(row)) if row else None
 
-    # =============================================================
-    # CONFIDENCE & STATE MODIFIERS
-    # =============================================================
-
-    def update_confidence(self, knowledge_id: str, confidence: float) -> bool:
-        with self._lock:
-            item = self.get(knowledge_id)
-            if item is None:
-                return False
-
-            item.confidence = self._clamp(confidence)
-            item.updated_at = time.time()
-            self._save_knowledge_to_db(item, faiss_id=self.id_to_faiss_idx.get(knowledge_id))
-            self.updated_at = item.updated_at
-            return True
-
-    def reinforce(self, knowledge_id: str, confidence_delta: float = 0.05) -> bool:
-        """Increase confidence when new evidence supports knowledge."""
-        with self._lock:
-            item = self.get(knowledge_id)
-            if item is None:
-                return False
-
-            item.evidence_count += 1
-            item.confidence = self._clamp(item.confidence + confidence_delta)
-            item.updated_at = time.time()
-            self._save_knowledge_to_db(item, faiss_id=self.id_to_faiss_idx.get(knowledge_id))
-            self.updated_at = item.updated_at
-            return True
-
-    def weaken(self, knowledge_id: str, confidence_delta: float = 0.10) -> bool:
-        """Reduce confidence when evidence contradicts knowledge."""
-        with self._lock:
-            item = self.get(knowledge_id)
-            if item is None:
-                return False
-
-            item.confidence = self._clamp(item.confidence - abs(confidence_delta))
-            item.updated_at = time.time()
-            self._save_knowledge_to_db(item, faiss_id=self.id_to_faiss_idx.get(knowledge_id))
-            self.updated_at = item.updated_at
-            return True
-
-    # =============================================================
-    # COUNT, CLEAR & PRUNE
-    # =============================================================
-
     @property
     def count(self) -> int:
         with self._lock, self._get_db_connection() as conn:
@@ -575,7 +504,6 @@ class SemanticMemory:
             return cursor.fetchone()[0]
 
     def clear(self) -> None:
-        """Purge all database records, graphs, and vector indexes."""
         with self._lock:
             with self._get_db_connection() as conn:
                 conn.execute("DELETE FROM knowledge")
@@ -596,7 +524,6 @@ class SemanticMemory:
             self.updated_at = time.time()
 
     def _prune(self) -> None:
-        """Prune low-importance knowledge records when capacity limit is exceeded."""
         current_count = self.count
         if current_count <= self.max_knowledge:
             return
@@ -616,61 +543,6 @@ class SemanticMemory:
         for k_id in to_remove:
             self.forget(k_id)
 
-    # =============================================================
-    # SNAPSHOT & RESTORE
-    # =============================================================
-
-    def snapshot(self, limit: Optional[int] = None) -> Dict[str, Any]:
-        with self._lock, self._get_db_connection() as conn:
-            query = "SELECT * FROM knowledge ORDER BY updated_at DESC"
-            if limit is not None:
-                query += f" LIMIT {max(0, limit)}"
-
-            cursor = conn.execute(query)
-            items = [Knowledge.from_dict(dict(row)) for row in cursor.fetchall()]
-
-            return {
-                "version": self.VERSION,
-                "count": len(items),
-                "max_knowledge": self.max_knowledge,
-                "created_at": self.created_at,
-                "updated_at": self.updated_at,
-                "knowledge": [item.to_dict() for item in items],
-            }
-
-    def restore(self, snapshot: Dict[str, Any]) -> None:
-        """Restore dataset state from a snapshot dictionary."""
-        if not isinstance(snapshot, dict):
-            return
-
-        raw_items = snapshot.get("knowledge", [])
-        if not isinstance(raw_items, list):
-            return
-
-        with self._lock:
-            self.clear()
-            for data in raw_items:
-                if isinstance(data, dict):
-                    try:
-                        item = Knowledge.from_dict(data)
-                        self.remember(
-                            subject=item.subject,
-                            predicate=item.predicate,
-                            value=item.value,
-                            confidence=item.confidence,
-                            importance=item.importance,
-                            source=item.source,
-                            tags=item.tags,
-                        )
-                    except Exception:
-                        continue
-
-            self.updated_at = time.time()
-
-    # =============================================================
-    # INTERNAL UTILITIES
-    # =============================================================
-
     def _save_knowledge_to_db(self, knowledge: Knowledge, faiss_id: Optional[int] = None) -> None:
         val_str = (
             json.dumps(knowledge.value)
@@ -687,12 +559,14 @@ class SemanticMemory:
                     importance, source, created_at, updated_at, evidence_count, tags, faiss_id
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(knowledge_id) DO UPDATE SET
+                    value=excluded.value,
                     confidence=excluded.confidence,
                     importance=excluded.importance,
                     source=excluded.source,
                     updated_at=excluded.updated_at,
                     evidence_count=excluded.evidence_count,
-                    tags=excluded.tags;
+                    tags=excluded.tags,
+                    faiss_id=excluded.faiss_id;
                 """,
                 (
                     knowledge.knowledge_id,
@@ -723,6 +597,10 @@ class SemanticMemory:
             faiss.write_index(self.faiss_index, self.faiss_index_path)
         except Exception as e:
             print(f"[SemanticMemory] Error saving FAISS index to disk: {e}")
+
+    def _find_by_trace(self, subject: str, predicate: str) -> Optional[Knowledge]:
+        items = self.find(subject, predicate)
+        return items[0] if items else None
 
     def _find_exact(self, subject: str, predicate: str, value: Any) -> Optional[Knowledge]:
         items = self.find(subject, predicate)

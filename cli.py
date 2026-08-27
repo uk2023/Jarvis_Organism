@@ -176,8 +176,9 @@ def execute_cognitive_query(jarvis, user_input: str, source: str = "cli") -> str
             }
             
             try:
-                reply = brain.think_and_respond(user_input, identity_profile=identity_profile)
+                reply = brain.think_and_respond(user_input, identity_profile=identity_profile, source=source)
                 pipeline_success = True
+                
             except Exception as err:
                 reply = f"[Brain Processing Fault: {err}]"
                 error_stack = traceback.format_exc()

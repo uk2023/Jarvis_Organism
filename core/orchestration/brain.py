@@ -161,12 +161,14 @@ class Brain:
     # =============================================================
     # THINK AND RESPOND (LLM + IDENTITY + MEMORY + PIPELINE)
     # =============================================================
-
+    
     def think_and_respond(
         self,
         user_input: str,
         identity_profile: Optional[Dict[str, Any]] = None,
+        source: str = "cli",
     ) -> str:
+    
         """
         Synthesizes Identity, Memory Context, and User Input,
         queries the LLM bridge (used purely as a voice — see
@@ -248,7 +250,7 @@ class Brain:
                     context={"user_input": user_input},
                     action={"jarvis_response": cleaned_response},
                     outcome=outcome,
-                    source="cli",
+                    source=source,
                     importance=0.6,
                     build_knowledge=True,
                     auto_accept=self.auto_accept_knowledge,
@@ -274,49 +276,47 @@ class Brain:
     # =============================================================
 
     _FACT_EXTRACTION_PROMPT = (
-        "You extract ONE factual statement from a conversation turn, "
-        "if one exists. Only extract facts the user explicitly stated "
-        "about themselves, people, or things they know (e.g. names, "
-        "preferences, relationships, dates). Do NOT extract questions, "
-        "greetings, small talk, or the assistant's own reply content.\n\n"
-        "Respond with ONLY compact JSON, nothing else, no markdown fences:\n"
-        '{"has_fact": true, "subject": "...", "predicate": "...", "value": "..."}\n'
-        "or, if there is no clear fact to remember:\n"
+        "You are an expert fact extractor for a personal AI companion. "
+        "Extract ONE factual statement from the conversation turn if one exists. "
+        "The user often speaks in Hinglish with minor spelling typos (e.g. 'nan' instead of 'naam'). "
+        "Correct typos automatically and extract clear subject, predicate, and value. "
+        "Return ONLY a raw JSON object. If no clear fact exists, return exactly: "
         '{"has_fact": false}\n\n'
-        "subject/predicate should be short lowercase phrases "
-        "(e.g. subject=\"uk_ex_girlfriend\", predicate=\"name\", value=\"Devyana\")."
+        "Examples:\n"
+        'User: "mera ex ka nan devyana h"\n'
+        'Output: {"has_fact": true, "subject": "user_ex", "predicate": "name", "value": "Devyana"}\n\n'
+        "subject/predicate should be short lowercase phrases."      
     )
 
     def _extract_fact(self, user_input: str, jarvis_response: str) -> Optional[Dict[str, Any]]:
-        """
-        Ask the LLM bridge to pull a subject/predicate/value triple out
-        of this turn, if the user stated one. Returns None on no-fact
-        or on any parsing/inference failure — extraction is best-effort
-        and must never break the chat turn itself.
-        """
         if self.llm is None:
             return None
 
+        # Thoda sa gap dein taaki key rotator next active key pick kar sake
+        import time
+        time.sleep(1.0)
+
+        raw = ""
         try:
             raw = self.llm.generate_response(
-                system_prompt=self._FACT_EXTRACTION_PROMPT,
+                system_prompt=getattr(self, "_FACT_EXTRACTION_PROMPT", "Extract facts as JSON with subject, predicate, value."),
                 user_input=f"User said: {user_input}\nAssistant replied: {jarvis_response}",
-                max_tokens=120,
+                max_tokens=500,
                 temperature=0.0,
             )
-        except Exception as exc:
-            print(f"[Brain Fact Extraction Warning] LLM call failed: {exc}")
+        except Exception as e:
+            print(f"[EXTRACT ERROR WITH KEYS]: {e}")
+
+        print(f"[DEBUG ROTATED KEY FACT OUTPUT]: {repr(raw)}")
+
+        if not raw or not isinstance(raw, str) or not raw.strip():
             return None
 
-        if not isinstance(raw, str):
-            return None
-
-        # Strip accidental ```json fences some models still add.
         cleaned = re.sub(r"^```(?:json)?|```$", "", raw.strip(), flags=re.MULTILINE).strip()
 
         try:
             data = json.loads(cleaned)
-        except (json.JSONDecodeError, ValueError):
+        except Exception:
             return None
 
         if not isinstance(data, dict) or not data.get("has_fact"):
@@ -329,7 +329,10 @@ class Brain:
         if not subject or not predicate or value in (None, ""):
             return None
 
+        print(f"[SUCCESS EXTRACTED]: {subject} -> {predicate} -> {value}")
         return {"subject": subject, "predicate": predicate, "value": value}
+
+
 
     # =============================================================
     # PROCESS EXPERIENCE
