@@ -6,3 +6,39 @@ __pycache__/
 *.log
 *.bak
 models/*.gguf
+
+
+# Large Models & Binaries
+*.gguf
+*.onnx
+*.bin
+
+# Databases & Backups
+*.db
+*.sqlite
+*.sqlite3
+*.bak
+database/*.db
+database/*.sqlite
+
+# FAISS Vectors & Embeddings
+faiss_index/
+vector_store/
+*.index
+*.faiss
+embeddings/
+
+# Sensitive & Config Files
+.env
+config.json
+secrets.json
+
+# Python Cache & Build
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+
+# Logs & Runtime Outputs
+*.log
+logs/
